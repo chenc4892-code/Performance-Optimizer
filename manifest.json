@@ -1,0 +1,12 @@
+{
+  "display_name": "Performance Optimizer",
+  "loading_order": 1,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "金瓜瓜@gua.guagua.uk",
+  "version": "1.0.0",
+  "homePage": "https://github.com/chenc4892-code/Performance-Optimizer.git",
+  "auto_update": true
+}
