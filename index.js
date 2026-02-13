@@ -4,6 +4,9 @@
  * Optimizes streaming performance by:
  * 1. Deferring regex processing until streaming completes
  * 2. Caching compiled RegExp objects to avoid repeated compilation
+ * 3. CSS containment — isolates message layout/paint so updates don't cascade
+ * 4. content-visibility: auto — browser skips rendering off-screen messages
+ * 5. Streaming CSS mode — disables heavy visual effects (blur, shadow) during streaming
  */
 
 import {
@@ -24,6 +27,8 @@ const defaultSettings = {
     enabled: true,
     deferRegexDuringStreaming: true,
     cacheRegex: true,
+    cssContainment: true,
+    reduceStreamingEffects: true,
 };
 
 // ===================== State =====================
@@ -139,6 +144,16 @@ let OriginalRegExp = null;
  */
 function enableRegexCache() {
     if (OriginalRegExp) return;
+
+    // WebKit (iOS/Safari) has a different RegExp implementation in
+    // JavaScriptCore. Replacing window.RegExp can break internal string
+    // operations and JSON parsing on that engine. Skip to be safe.
+    const isWebKit = /AppleWebKit/.test(navigator.userAgent) && !/Chrome\//.test(navigator.userAgent);
+    if (isWebKit) {
+        console.debug(`${LOG_PREFIX} RegExp cache skipped (WebKit detected)`);
+        return;
+    }
+
     OriginalRegExp = window.RegExp;
 
     const Cached = function RegExp(pattern, flags) {
@@ -204,6 +219,65 @@ function disableRegexCache() {
     console.debug(`${LOG_PREFIX} RegExp cache disabled`);
 }
 
+// ===================== Optimization 3+4: CSS Containment & Content Visibility =====================
+
+const CONTAINMENT_STYLE_ID = 'perf-opt-containment';
+
+/**
+ * Inject a <style> element that adds CSS containment and content-visibility
+ * to chat messages.
+ *
+ * - `contain: layout style` makes each .mes an independent layout context,
+ *   so updating one message (e.g. during streaming) doesn't trigger reflow
+ *   of every other message in the chat container.
+ *
+ * - `content-visibility: auto` tells the browser to skip rendering messages
+ *   that are scrolled out of the viewport. For long chats (100+ messages)
+ *   this dramatically reduces layout, paint, and compositing costs.
+ *
+ * - `contain-intrinsic-size: auto 200px` provides an estimated height for
+ *   off-screen messages so the scrollbar remains stable.
+ */
+function enableCSSContainment() {
+    if (document.getElementById(CONTAINMENT_STYLE_ID)) return;
+    const style = document.createElement('style');
+    style.id = CONTAINMENT_STYLE_ID;
+    style.textContent = `
+        #chat .mes {
+            contain: layout style;
+            content-visibility: auto;
+            contain-intrinsic-size: auto 200px;
+        }
+    `;
+    document.head.appendChild(style);
+    console.debug(`${LOG_PREFIX} CSS containment enabled`);
+}
+
+function disableCSSContainment() {
+    const el = document.getElementById(CONTAINMENT_STYLE_ID);
+    if (el) {
+        el.remove();
+        console.debug(`${LOG_PREFIX} CSS containment disabled`);
+    }
+}
+
+// ===================== Optimization 5: Streaming CSS Mode =====================
+
+/**
+ * Add `perf-streaming` class to <body> during streaming. CSS rules in
+ * style.css use this class to disable GPU-heavy effects (backdrop-filter,
+ * box-shadow, transitions, filter) while the AI is generating.
+ *
+ * Effects are restored instantly when the class is removed after generation.
+ */
+function enableStreamingCSSMode() {
+    document.body.classList.add('perf-streaming');
+}
+
+function disableStreamingCSSMode() {
+    document.body.classList.remove('perf-streaming');
+}
+
 // ===================== Event Handlers =====================
 
 function onGenerationStarted(type) {
@@ -227,6 +301,11 @@ function onStreamTokenReceived() {
     if (!regexDisabled) {
         disableRegexForStreaming();
         regexDisabled = true;
+
+        // Optimization 5: reduce visual effects during streaming
+        if (settings.reduceStreamingEffects) {
+            enableStreamingCSSMode();
+        }
     }
 }
 
@@ -241,6 +320,9 @@ function onGenerationEnded() {
     // onProgressStreaming(true) call. So the final processing will have regex
     // enabled and produce the correct output.
     restoreRegexAfterStreaming();
+
+    // Restore visual effects
+    disableStreamingCSSMode();
 
     // Safety re-render after a short delay, in case the event ordering changes
     // in future SillyTavern versions
@@ -258,6 +340,7 @@ function onGenerationStopped() {
     regexDisabled = false;
 
     restoreRegexAfterStreaming();
+    disableStreamingCSSMode();
     setTimeout(() => {
         rerenderLastMessage();
         console.debug(`${LOG_PREFIX} Generation stopped — regex restored`);
@@ -277,15 +360,15 @@ function createSettingsUI() {
         </div>
         <div class="inline-drawer-content" style="display: none;">
             <div class="perf-opt-desc">
-                Reduces CPU waste during AI streaming by deferring heavy
-                processing to after generation completes.
+                通过延迟和缓存策略减少 AI 流式输出期间的 CPU/GPU 浪费，
+                提升酒馆整体流畅度。
             </div>
 
             <div class="perf-opt-item">
                 <label for="perf_opt_enabled">
                     <input type="checkbox" id="perf_opt_enabled"
                         ${settings.enabled ? 'checked' : ''} />
-                    Enable Performance Optimizer
+                    启用性能优化器
                 </label>
             </div>
 
@@ -295,31 +378,56 @@ function createSettingsUI() {
                 <label for="perf_opt_defer_regex">
                     <input type="checkbox" id="perf_opt_defer_regex"
                         ${settings.deferRegexDuringStreaming ? 'checked' : ''} />
-                    Defer regex during streaming
+                    流式期间延迟正则处理
                 </label>
             </div>
             <div class="perf-opt-desc">
-                Skips all regex script execution during streaming frames.
-                Regex is applied once after the response completes. This
-                eliminates the biggest CPU bottleneck — repeated regex
-                compilation and execution on incomplete text every frame.
+                AI 输出时跳过所有正则脚本的执行，等响应结束后一次性处理。
+                消除最大的 CPU 瓶颈——每帧重复编译和执行正则。
             </div>
 
             <div class="perf-opt-item">
                 <label for="perf_opt_cache_regex">
                     <input type="checkbox" id="perf_opt_cache_regex"
                         ${settings.cacheRegex ? 'checked' : ''} />
-                    Cache RegExp compilation
+                    缓存正则编译结果
                 </label>
             </div>
             <div class="perf-opt-desc">
-                Caches compiled regular expressions so identical patterns
-                aren't recompiled on every use. Benefits the entire app,
-                not just streaming.
+                缓存已编译的正则表达式，相同 pattern 不再重复编译。
+                对整个酒馆都有效，不仅限于流式输出。
+            </div>
+
+            <div class="perf-opt-item">
+                <label for="perf_opt_css_containment">
+                    <input type="checkbox" id="perf_opt_css_containment"
+                        ${settings.cssContainment ? 'checked' : ''} />
+                    CSS 渲染隔离
+                </label>
+            </div>
+            <div class="perf-opt-desc">
+                隔离每条消息的布局计算，更新一条消息不会触发整个聊天区域重排。
+                同时跳过屏幕外消息的渲染，长对话受益显著。
+            </div>
+
+            <div class="perf-opt-item">
+                <label for="perf_opt_reduce_effects">
+                    <input type="checkbox" id="perf_opt_reduce_effects"
+                        ${settings.reduceStreamingEffects ? 'checked' : ''} />
+                    流式期间降低视觉特效
+                </label>
+            </div>
+            <div class="perf-opt-desc">
+                AI 输出时临时关闭模糊、阴影、过渡动画等 GPU 密集特效，
+                响应结束后立即恢复。
             </div>
 
             <div class="perf-opt-stats" id="perf_opt_stats">
-                <i>Stats will appear after the first generation.</i>
+                <i>统计数据将在首次生成后显示。</i>
+            </div>
+
+            <div class="perf-opt-author">
+                金瓜瓜@gua.guagua.uk
             </div>
         </div>
     </div>`;
@@ -347,6 +455,21 @@ function createSettingsUI() {
         saveSettingsDebounced();
     });
 
+    $('#perf_opt_css_containment').on('change', function () {
+        settings.cssContainment = this.checked;
+        if (this.checked) {
+            enableCSSContainment();
+        } else {
+            disableCSSContainment();
+        }
+        saveSettingsDebounced();
+    });
+
+    $('#perf_opt_reduce_effects').on('change', function () {
+        settings.reduceStreamingEffects = this.checked;
+        saveSettingsDebounced();
+    });
+
     // Drawer toggle is handled globally by SillyTavern's core click handler
     // on '.inline-drawer-toggle' — no need to bind our own.
 }
@@ -356,14 +479,14 @@ function updateStatsUI() {
     if (!statsEl) return;
 
     const lines = [
-        '<b>Session stats:</b>',
-        `Regex deferred: ${stats.regexSkipped} generation(s)`,
+        '<b>本次会话统计：</b>',
+        `正则延迟：${stats.regexSkipped} 次生成`,
     ];
 
     if (OriginalRegExp) {
         const total = stats.regexCacheHits + stats.regexCacheMisses;
         const hitRate = total > 0 ? ((stats.regexCacheHits / total) * 100).toFixed(1) : '0';
-        lines.push(`RegExp cache: ${stats.regexCacheHits}/${total} hits (${hitRate}%), ${regexCache.size} entries`);
+        lines.push(`正则缓存：${stats.regexCacheHits}/${total} 命中 (${hitRate}%)，${regexCache.size} 条缓存`);
     }
 
     statsEl.innerHTML = lines.join('<br>');
@@ -372,26 +495,35 @@ function updateStatsUI() {
 // ===================== Initialization =====================
 
 (function init() {
-    const settings = getSettings();
+    try {
+        const settings = getSettings();
 
-    createSettingsUI();
+        createSettingsUI();
 
-    // Core event hooks
-    eventSource.on(event_types.GENERATION_STARTED, onGenerationStarted);
-    eventSource.on(event_types.STREAM_TOKEN_RECEIVED, onStreamTokenReceived);
-    eventSource.on(event_types.GENERATION_ENDED, () => {
-        onGenerationEnded();
-        updateStatsUI();
-    });
-    eventSource.on(event_types.GENERATION_STOPPED, () => {
-        onGenerationStopped();
-        updateStatsUI();
-    });
+        // Core event hooks
+        eventSource.on(event_types.GENERATION_STARTED, onGenerationStarted);
+        eventSource.on(event_types.STREAM_TOKEN_RECEIVED, onStreamTokenReceived);
+        eventSource.on(event_types.GENERATION_ENDED, () => {
+            onGenerationEnded();
+            updateStatsUI();
+        });
+        eventSource.on(event_types.GENERATION_STOPPED, () => {
+            onGenerationStopped();
+            updateStatsUI();
+        });
 
-    // Enable regex cache on startup
-    if (settings.enabled && settings.cacheRegex) {
-        enableRegexCache();
+        // Enable regex cache on startup
+        if (settings.enabled && settings.cacheRegex) {
+            enableRegexCache();
+        }
+
+        // Enable CSS containment on startup
+        if (settings.enabled && settings.cssContainment) {
+            enableCSSContainment();
+        }
+
+        console.log(`${LOG_PREFIX} Loaded — enabled=${settings.enabled}, deferRegex=${settings.deferRegexDuringStreaming}, cacheRegex=${settings.cacheRegex}, cssContainment=${settings.cssContainment}, reduceEffects=${settings.reduceStreamingEffects}`);
+    } catch (err) {
+        console.error(`${LOG_PREFIX} Failed to initialize — SillyTavern will continue normally.`, err);
     }
-
-    console.log(`${LOG_PREFIX} Loaded — enabled=${settings.enabled}, deferRegex=${settings.deferRegexDuringStreaming}, cacheRegex=${settings.cacheRegex}`);
 })();

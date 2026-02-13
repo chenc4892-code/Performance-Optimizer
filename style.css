@@ -39,3 +39,37 @@
     border-top: 1px solid var(--SmartThemeBorderColor);
     margin-top: 5px;
 }
+
+#perf-optimizer-settings .perf-opt-author {
+    font-size: 0.8em;
+    opacity: 0.5;
+    text-align: right;
+    padding-top: 8px;
+    font-style: italic;
+}
+
+/* ====== Optimization 5: Streaming Visual Effects Reduction ====== */
+
+/* Disable backdrop-filter (blur) during streaming — biggest GPU cost */
+body.perf-streaming * {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+}
+
+/* Disable background image filters during streaming */
+body.perf-streaming #bg1,
+body.perf-streaming #bg_custom {
+    filter: none !important;
+}
+
+/* Disable transitions and box-shadow on chat messages during streaming */
+body.perf-streaming #chat .mes {
+    transition: none !important;
+    box-shadow: none !important;
+}
+
+/* Disable drop-shadow filters during streaming */
+body.perf-streaming .mes .avatar,
+body.perf-streaming .mes .mes_buttons {
+    filter: none !important;
+}
