@@ -237,6 +237,11 @@ const CONTAINMENT_STYLE_ID = 'perf-opt-containment';
  *
  * - `contain-intrinsic-size: auto 200px` provides an estimated height for
  *   off-screen messages so the scrollbar remains stable.
+ *
+ * Note: content-visibility: auto is only applied to messages that are at
+ * least 5 from the bottom (via :nth-last-child). The last few messages
+ * always render at their true height, preventing scroll jumping during
+ * swipes and re-rolls — which only affect the bottom of the chat.
  */
 function enableCSSContainment() {
     if (document.getElementById(CONTAINMENT_STYLE_ID)) return;
@@ -245,6 +250,8 @@ function enableCSSContainment() {
     style.textContent = `
         #chat .mes {
             contain: layout style;
+        }
+        #chat .mes:nth-last-child(n+5) {
             content-visibility: auto;
             contain-intrinsic-size: auto 200px;
         }
