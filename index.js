@@ -100,6 +100,10 @@ function restoreRegexAfterStreaming() {
 /**
  * Re-render the last AI message with full formatting (including regex).
  * Called after streaming ends so the final message gets proper treatment.
+ *
+ * After setting innerHTML, we emit CHARACTER_MESSAGE_RENDERED so that other
+ * extensions (e.g. 酒馆助手/JS-Slash-Runner) can post-process the message
+ * — for example, converting HTML code blocks into rendered iframes.
  */
 function rerenderLastMessage() {
     const lastMesId = chat.length - 1;
@@ -122,6 +126,10 @@ function rerenderLastMessage() {
     if (mesElement) {
         mesElement.innerHTML = formattedText;
         console.debug(`${LOG_PREFIX} Final message re-rendered with regex`);
+
+        // Notify other extensions that the message DOM has been replaced,
+        // so they can re-apply post-processing (iframe rendering, etc.)
+        eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, lastMesId);
     }
 }
 
