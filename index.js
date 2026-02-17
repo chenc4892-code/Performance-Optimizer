@@ -7,6 +7,9 @@
  * 3. CSS containment — isolates message layout/paint so updates don't cascade
  * 4. content-visibility: auto — browser skips rendering off-screen messages
  * 5. Streaming CSS mode — disables heavy visual effects (blur, shadow) during streaming
+ * 6. Lightweight HTML/iframe renderer — replaces heavy JS-Slash-Runner rendering
+ * 7. Tab-switch scroll preservation — prevents scroll jumping on mobile
+ * 8. Global blur suppression — disables backdrop-filter for mobile battery savings
  */
 
 import {
@@ -23,12 +26,18 @@ const LOG_PREFIX = '[PerfOpt]';
 
 // ===================== Default Settings =====================
 
+const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
+    || (navigator.maxTouchPoints > 1 && window.innerWidth < 1024);
+
 const defaultSettings = {
     enabled: true,
     deferRegexDuringStreaming: true,
     cacheRegex: true,
     cssContainment: true,
     reduceStreamingEffects: true,
+    lightHtmlRenderer: true,
+    preventScrollJump: true,
+    globalBlurSuppression: isMobile,
 };
 
 // ===================== State =====================
@@ -40,6 +49,9 @@ let stats = {
     regexSkipped: 0,
     regexCacheHits: 0,
     regexCacheMisses: 0,
+    iframesCreated: 0,
+    iframesDestroyed: 0,
+    scrollRestored: 0,
 };
 
 // ===================== Settings =====================
@@ -102,8 +114,7 @@ function restoreRegexAfterStreaming() {
  * Called after streaming ends so the final message gets proper treatment.
  *
  * After setting innerHTML, we emit CHARACTER_MESSAGE_RENDERED so that other
- * extensions (e.g. 酒馆助手/JS-Slash-Runner) can post-process the message
- * — for example, converting HTML code blocks into rendered iframes.
+ * extensions (and our own iframe renderer) can post-process the message.
  */
 function rerenderLastMessage() {
     const lastMesId = chat.length - 1;
@@ -293,6 +304,269 @@ function disableStreamingCSSMode() {
     document.body.classList.remove('perf-streaming');
 }
 
+// ===================== Optimization 6: Lightweight HTML/iframe Renderer =====================
+
+/**
+ * A lightweight alternative to JS-Slash-Runner's heavy iframe rendering.
+ *
+ * Instead of loading jQuery + Vue + Tailwind + FontAwesome into every iframe,
+ * this renderer creates minimal iframes with just the HTML content and a tiny
+ * height-adjustment script (~15 lines). Combined with IntersectionObserver
+ * for lazy loading, this reduces per-iframe overhead from ~500KB to ~1KB.
+ *
+ * Detection uses the same logic as JS-Slash-Runner: checks for 'html>',
+ * '<head>', or '<body' in <pre><code> blocks.
+ */
+
+/** Map of placeholder element -> { htmlContent, iframe } */
+const iframePlaceholders = new Map();
+let iframeObserver = null;
+
+function isHTMLContent(text) {
+    return ['html>', '<head>', '<body'].some(tag => text.includes(tag));
+}
+
+function buildIframeSrcdoc(htmlContent) {
+    return `<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+html,body{margin:0;padding:0;overflow:hidden;max-width:100%;}
+</style>
+</head><body>
+${htmlContent}
+<script>
+(function(){
+    var scheduled=false;
+    function measure(){
+        scheduled=false;
+        var h=document.body.scrollHeight;
+        if(h>0&&window.frameElement)window.frameElement.style.height=h+'px';
+    }
+    new ResizeObserver(function(){
+        if(scheduled)return;
+        scheduled=true;
+        requestAnimationFrame(measure);
+    }).observe(document.body);
+    measure();
+})();
+</script>
+</body></html>`;
+}
+
+function createIframeForPlaceholder(placeholder) {
+    const data = iframePlaceholders.get(placeholder);
+    if (!data || data.iframe) return;
+
+    const iframe = document.createElement('iframe');
+    iframe.className = 'perf-opt-iframe';
+    iframe.frameBorder = '0';
+    iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin');
+    iframe.srcdoc = buildIframeSrcdoc(data.htmlContent);
+
+    placeholder.textContent = '';
+    placeholder.appendChild(iframe);
+    data.iframe = iframe;
+    stats.iframesCreated++;
+    console.debug(`${LOG_PREFIX} Iframe created (total: ${stats.iframesCreated})`);
+}
+
+function destroyIframeForPlaceholder(placeholder) {
+    const data = iframePlaceholders.get(placeholder);
+    if (!data || !data.iframe) return;
+
+    data.iframe.srcdoc = '';
+    data.iframe.remove();
+    data.iframe = null;
+    placeholder.textContent = 'HTML（滚动到此处加载）';
+    stats.iframesDestroyed++;
+}
+
+function getIframeObserver() {
+    if (iframeObserver) return iframeObserver;
+
+    iframeObserver = new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+            const placeholder = entry.target;
+            if (!iframePlaceholders.has(placeholder)) continue;
+
+            if (entry.isIntersecting) {
+                createIframeForPlaceholder(placeholder);
+            } else {
+                destroyIframeForPlaceholder(placeholder);
+            }
+        }
+    }, {
+        root: document.getElementById('chat'),
+        rootMargin: '300px 0px',
+    });
+
+    return iframeObserver;
+}
+
+function processMessageForIframes(mesId) {
+    const settings = getSettings();
+    if (!settings.enabled || !settings.lightHtmlRenderer) return;
+
+    const mesText = document.querySelector(`#chat .mes[mesid="${mesId}"] .mes_text`);
+    if (!mesText) return;
+
+    const codeBlocks = mesText.querySelectorAll('pre code');
+    for (const code of codeBlocks) {
+        const text = code.textContent || '';
+        if (!isHTMLContent(text)) continue;
+
+        const pre = code.closest('pre');
+        if (!pre || pre.dataset.perfOptProcessed) continue;
+        pre.dataset.perfOptProcessed = 'true';
+
+        // Decode HTML entities that DOMPurify/Showdown may have introduced
+        const tmp = document.createElement('textarea');
+        tmp.innerHTML = text;
+        const htmlContent = tmp.value;
+
+        // Create placeholder
+        const placeholder = document.createElement('div');
+        placeholder.className = 'perf-opt-iframe-placeholder';
+        placeholder.textContent = 'HTML（加载中...）';
+
+        iframePlaceholders.set(placeholder, { htmlContent, iframe: null });
+
+        pre.replaceWith(placeholder);
+
+        // Register with IntersectionObserver
+        getIframeObserver().observe(placeholder);
+    }
+}
+
+function processAllMessagesForIframes() {
+    const settings = getSettings();
+    if (!settings.enabled || !settings.lightHtmlRenderer) return;
+
+    const messages = document.querySelectorAll('#chat .mes');
+    for (const mes of messages) {
+        const mesId = mes.getAttribute('mesid');
+        if (mesId !== null) {
+            processMessageForIframes(mesId);
+        }
+    }
+}
+
+function cleanupAllIframes() {
+    if (iframeObserver) {
+        iframeObserver.disconnect();
+        iframeObserver = null;
+    }
+    for (const [, data] of iframePlaceholders) {
+        if (data.iframe) {
+            data.iframe.srcdoc = '';
+            data.iframe.remove();
+        }
+    }
+    iframePlaceholders.clear();
+    console.debug(`${LOG_PREFIX} All iframes cleaned up`);
+}
+
+// ===================== Optimization 7: Tab-switch Scroll Preservation =====================
+
+/**
+ * When the user switches away from the browser (e.g. checking another app
+ * on mobile), the browser may recalculate layout for content-visibility: auto
+ * elements, causing scroll position to jump when returning.
+ *
+ * This module saves the scroll position (as distance-from-bottom) when the
+ * page becomes hidden, and restores it after two animation frames when the
+ * page becomes visible again — giving the browser time to settle layout.
+ *
+ * We use distance-from-bottom because the last few messages don't use
+ * content-visibility (thanks to :nth-last-child), so their heights are
+ * stable and the bottom reference point is reliable.
+ */
+
+let savedScrollInfo = null;
+
+function onVisibilityChange() {
+    const settings = getSettings();
+    if (!settings.enabled || !settings.preventScrollJump) return;
+
+    const chatElement = document.getElementById('chat');
+    if (!chatElement) return;
+
+    if (document.hidden) {
+        // Save scroll position relative to bottom
+        savedScrollInfo = {
+            scrollTop: chatElement.scrollTop,
+            scrollHeight: chatElement.scrollHeight,
+            clientHeight: chatElement.clientHeight,
+            distanceFromBottom: chatElement.scrollHeight - chatElement.scrollTop - chatElement.clientHeight,
+        };
+        console.debug(`${LOG_PREFIX} Scroll position saved (distFromBottom: ${savedScrollInfo.distanceFromBottom.toFixed(0)}px)`);
+    } else {
+        if (!savedScrollInfo) return;
+        const info = savedScrollInfo;
+        savedScrollInfo = null;
+
+        // Wait two frames for layout to stabilize after tab restore
+        requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+                const newScrollTop = chatElement.scrollHeight - chatElement.clientHeight - info.distanceFromBottom;
+                chatElement.scrollTop = Math.max(0, newScrollTop);
+                stats.scrollRestored++;
+                console.debug(`${LOG_PREFIX} Scroll position restored (distFromBottom: ${info.distanceFromBottom.toFixed(0)}px)`);
+            });
+        });
+    }
+}
+
+function enableScrollPreservation() {
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    console.debug(`${LOG_PREFIX} Scroll preservation enabled`);
+}
+
+function disableScrollPreservation() {
+    document.removeEventListener('visibilitychange', onVisibilityChange);
+    savedScrollInfo = null;
+    console.debug(`${LOG_PREFIX} Scroll preservation disabled`);
+}
+
+// ===================== Optimization 8: Global Blur Suppression =====================
+
+/**
+ * SillyTavern's style.css has 26+ backdrop-filter: blur() declarations.
+ * On mobile, these cause sustained GPU compositing even when not streaming.
+ * This option permanently removes all blur effects for significant battery
+ * savings. Unlike the streaming-only mode, this stays active all the time.
+ */
+
+const BLUR_SUPPRESS_STYLE_ID = 'perf-opt-no-blur';
+
+function enableGlobalBlurSuppression() {
+    if (document.getElementById(BLUR_SUPPRESS_STYLE_ID)) return;
+    const style = document.createElement('style');
+    style.id = BLUR_SUPPRESS_STYLE_ID;
+    style.textContent = `
+        body.perf-no-blur *,
+        body.perf-no-blur *::before,
+        body.perf-no-blur *::after {
+            backdrop-filter: none !important;
+            -webkit-backdrop-filter: none !important;
+        }
+    `;
+    document.head.appendChild(style);
+    document.body.classList.add('perf-no-blur');
+    console.debug(`${LOG_PREFIX} Global blur suppression enabled`);
+}
+
+function disableGlobalBlurSuppression() {
+    document.body.classList.remove('perf-no-blur');
+    const el = document.getElementById(BLUR_SUPPRESS_STYLE_ID);
+    if (el) {
+        el.remove();
+        console.debug(`${LOG_PREFIX} Global blur suppression disabled`);
+    }
+}
+
 // ===================== Event Handlers =====================
 
 function onGenerationStarted(type) {
@@ -389,6 +663,8 @@ function createSettingsUI() {
 
             <hr />
 
+            <div class="perf-opt-section-title">流式输出优化</div>
+
             <div class="perf-opt-item">
                 <label for="perf_opt_defer_regex">
                     <input type="checkbox" id="perf_opt_defer_regex"
@@ -435,6 +711,51 @@ function createSettingsUI() {
             <div class="perf-opt-desc">
                 AI 输出时临时关闭模糊、阴影、过渡动画等 GPU 密集特效，
                 响应结束后立即恢复。
+            </div>
+
+            <hr />
+
+            <div class="perf-opt-section-title">HTML 渲染与显示</div>
+
+            <div class="perf-opt-item">
+                <label for="perf_opt_light_html">
+                    <input type="checkbox" id="perf_opt_light_html"
+                        ${settings.lightHtmlRenderer ? 'checked' : ''} />
+                    轻量 HTML 渲染
+                </label>
+            </div>
+            <div class="perf-opt-desc">
+                用轻量 iframe 渲染消息中的 HTML 代码块，不加载 jQuery/Vue/Tailwind
+                等库。配合关闭酒馆助手的渲染模块使用，大幅降低内存和 CPU 占用。
+                支持视口懒加载——屏幕外的 iframe 不会被创建。
+            </div>
+
+            <hr />
+
+            <div class="perf-opt-section-title">移动端优化</div>
+
+            <div class="perf-opt-item">
+                <label for="perf_opt_scroll_preserve">
+                    <input type="checkbox" id="perf_opt_scroll_preserve"
+                        ${settings.preventScrollJump ? 'checked' : ''} />
+                    防止切屏跳滚
+                </label>
+            </div>
+            <div class="perf-opt-desc">
+                切出浏览器再回来时，保持聊天滚动位置不变。
+                解决 content-visibility 优化导致的切屏后滚动跳跃问题。
+            </div>
+
+            <div class="perf-opt-item">
+                <label for="perf_opt_no_blur">
+                    <input type="checkbox" id="perf_opt_no_blur"
+                        ${settings.globalBlurSuppression ? 'checked' : ''} />
+                    全局关闭模糊特效
+                </label>
+            </div>
+            <div class="perf-opt-desc">
+                永久关闭所有 backdrop-filter 模糊特效（不仅限于流式期间）。
+                手机上可显著降低 GPU 负载和耗电。${isMobile ? '（已检测到移动端，默认开启）' : ''}
             </div>
 
             <div class="perf-opt-stats" id="perf_opt_stats">
@@ -485,6 +806,36 @@ function createSettingsUI() {
         saveSettingsDebounced();
     });
 
+    $('#perf_opt_light_html').on('change', function () {
+        settings.lightHtmlRenderer = this.checked;
+        if (this.checked) {
+            processAllMessagesForIframes();
+        } else {
+            cleanupAllIframes();
+        }
+        saveSettingsDebounced();
+    });
+
+    $('#perf_opt_scroll_preserve').on('change', function () {
+        settings.preventScrollJump = this.checked;
+        if (this.checked) {
+            enableScrollPreservation();
+        } else {
+            disableScrollPreservation();
+        }
+        saveSettingsDebounced();
+    });
+
+    $('#perf_opt_no_blur').on('change', function () {
+        settings.globalBlurSuppression = this.checked;
+        if (this.checked) {
+            enableGlobalBlurSuppression();
+        } else {
+            disableGlobalBlurSuppression();
+        }
+        saveSettingsDebounced();
+    });
+
     // Drawer toggle is handled globally by SillyTavern's core click handler
     // on '.inline-drawer-toggle' — no need to bind our own.
 }
@@ -502,6 +853,15 @@ function updateStatsUI() {
         const total = stats.regexCacheHits + stats.regexCacheMisses;
         const hitRate = total > 0 ? ((stats.regexCacheHits / total) * 100).toFixed(1) : '0';
         lines.push(`正则缓存：${stats.regexCacheHits}/${total} 命中 (${hitRate}%)，${regexCache.size} 条缓存`);
+    }
+
+    if (stats.iframesCreated > 0) {
+        lines.push(`HTML 渲染：${stats.iframesCreated} 个 iframe 创建，${stats.iframesDestroyed} 个已回收`);
+        lines.push(`当前活跃：${stats.iframesCreated - stats.iframesDestroyed} 个 iframe`);
+    }
+
+    if (stats.scrollRestored > 0) {
+        lines.push(`滚动恢复：${stats.scrollRestored} 次`);
     }
 
     statsEl.innerHTML = lines.join('<br>');
@@ -537,7 +897,38 @@ function updateStatsUI() {
             enableCSSContainment();
         }
 
-        console.log(`${LOG_PREFIX} Loaded — enabled=${settings.enabled}, deferRegex=${settings.deferRegexDuringStreaming}, cacheRegex=${settings.cacheRegex}, cssContainment=${settings.cssContainment}, reduceEffects=${settings.reduceStreamingEffects}`);
+        // ---- New modules ----
+
+        // Optimization 6: Lightweight HTML renderer
+        if (settings.enabled && settings.lightHtmlRenderer) {
+            // Process messages as they render
+            eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, (mesId) => {
+                processMessageForIframes(mesId);
+            });
+            eventSource.on(event_types.USER_MESSAGE_RENDERED, (mesId) => {
+                processMessageForIframes(mesId);
+            });
+
+            // Process all messages when a chat is loaded
+            eventSource.on(event_types.CHAT_CHANGED, () => {
+                // Clean up previous chat's iframes
+                cleanupAllIframes();
+                // Small delay to let the DOM populate
+                setTimeout(() => processAllMessagesForIframes(), 200);
+            });
+        }
+
+        // Optimization 7: Tab-switch scroll preservation
+        if (settings.enabled && settings.preventScrollJump) {
+            enableScrollPreservation();
+        }
+
+        // Optimization 8: Global blur suppression
+        if (settings.enabled && settings.globalBlurSuppression) {
+            enableGlobalBlurSuppression();
+        }
+
+        console.log(`${LOG_PREFIX} v2.0.0 Loaded — enabled=${settings.enabled}, deferRegex=${settings.deferRegexDuringStreaming}, cacheRegex=${settings.cacheRegex}, cssContainment=${settings.cssContainment}, reduceEffects=${settings.reduceStreamingEffects}, lightHTML=${settings.lightHtmlRenderer}, scrollPreserve=${settings.preventScrollJump}, noBlur=${settings.globalBlurSuppression}`);
     } catch (err) {
         console.error(`${LOG_PREFIX} Failed to initialize — SillyTavern will continue normally.`, err);
     }

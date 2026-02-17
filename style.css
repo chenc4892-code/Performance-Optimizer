@@ -32,6 +32,13 @@
     margin-bottom: 8px;
 }
 
+#perf-optimizer-settings .perf-opt-section-title {
+    font-size: 0.9em;
+    font-weight: bold;
+    opacity: 0.85;
+    margin: 4px 0 6px 0;
+}
+
 #perf-optimizer-settings .perf-opt-stats {
     font-size: 0.85em;
     opacity: 0.8;
@@ -72,4 +79,39 @@ body.perf-streaming #chat .mes {
 body.perf-streaming .mes .avatar,
 body.perf-streaming .mes .mes_buttons {
     filter: none !important;
+}
+
+/* ====== Optimization 6: Lightweight iframe renderer ====== */
+
+.perf-opt-iframe {
+    width: 100%;
+    border: none;
+    border-radius: 4px;
+    display: block;
+    min-height: 50px;
+    background: var(--SmartThemeBlurTintColor, rgba(0, 0, 0, 0.3));
+    transition: height 0.15s ease-out;
+}
+
+.perf-opt-iframe-placeholder {
+    width: 100%;
+    min-height: 60px;
+    border-radius: 4px;
+    background: var(--SmartThemeBlurTintColor, rgba(0, 0, 0, 0.15));
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0.6;
+    font-size: 0.85em;
+    color: var(--SmartThemeBodyColor, #ccc);
+    border: 1px dashed var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.15));
+}
+
+/* ====== Optimization 8: Global blur suppression ====== */
+
+body.perf-no-blur *,
+body.perf-no-blur *::before,
+body.perf-no-blur *::after {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
 }
