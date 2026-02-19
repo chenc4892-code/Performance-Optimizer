@@ -318,9 +318,21 @@ function disableStreamingCSSMode() {
  * '<head>', or '<body' in <pre><code> blocks.
  */
 
-/** Map of placeholder element -> { htmlContent, iframe } */
+/** Map of placeholder element -> { htmlContent, iframe, mesId } */
 const iframePlaceholders = new Map();
 let iframeObserver = null;
+
+/** postMessage handler — receives height updates from sandboxed iframes */
+function onIframeResizeMessage(e) {
+    if (!e.data || e.data.type !== 'perf-opt-resize') return;
+    for (const [, data] of iframePlaceholders) {
+        if (data.iframe && data.iframe.contentWindow === e.source) {
+            data.iframe.style.height = e.data.height + 'px';
+            break;
+        }
+    }
+}
+window.addEventListener('message', onIframeResizeMessage);
 
 function isHTMLContent(text) {
     return ['html>', '<head>', '<body'].some(tag => text.includes(tag));
@@ -338,18 +350,18 @@ html,body{margin:0;padding:0;overflow:hidden;max-width:100%;}
 ${htmlContent}
 <script>
 (function(){
-    var scheduled=false;
-    function measure(){
-        scheduled=false;
+    // window.frameElement is null in sandboxed iframes — use postMessage instead
+    function sendHeight(){
         var h=document.body.scrollHeight;
-        if(h>0&&window.frameElement)window.frameElement.style.height=h+'px';
+        if(h>0) window.parent.postMessage({type:'perf-opt-resize',height:h},'*');
     }
-    new ResizeObserver(function(){
-        if(scheduled)return;
-        scheduled=true;
-        requestAnimationFrame(measure);
-    }).observe(document.body);
-    measure();
+    new ResizeObserver(function(){requestAnimationFrame(sendHeight);}).observe(document.body);
+    if(document.readyState==='loading'){
+        document.addEventListener('DOMContentLoaded',sendHeight);
+    } else {
+        sendHeight();
+    }
+    window.addEventListener('load',sendHeight);
 })();
 </script>
 </body></html>`;
@@ -412,6 +424,10 @@ function processMessageForIframes(mesId) {
     const mesText = document.querySelector(`#chat .mes[mesid="${mesId}"] .mes_text`);
     if (!mesText) return;
 
+    // Clean up any stale placeholders from a previous render of this message
+    // (happens after edits/swipes when .mes_text innerHTML is fully replaced)
+    cleanupPlaceholdersForMessage(mesId);
+
     const codeBlocks = mesText.querySelectorAll('pre code');
     for (const code of codeBlocks) {
         const text = code.textContent || '';
@@ -431,7 +447,7 @@ function processMessageForIframes(mesId) {
         placeholder.className = 'perf-opt-iframe-placeholder';
         placeholder.textContent = 'HTML（加载中...）';
 
-        iframePlaceholders.set(placeholder, { htmlContent, iframe: null });
+        iframePlaceholders.set(placeholder, { htmlContent, iframe: null, mesId });
 
         pre.replaceWith(placeholder);
 
@@ -450,6 +466,25 @@ function processAllMessagesForIframes() {
         if (mesId !== null) {
             processMessageForIframes(mesId);
         }
+    }
+}
+
+function cleanupPlaceholdersForMessage(mesId) {
+    const toRemove = [];
+    for (const [placeholder, data] of iframePlaceholders) {
+        if (String(data.mesId) !== String(mesId)) continue;
+        if (iframeObserver) iframeObserver.unobserve(placeholder);
+        if (data.iframe) {
+            data.iframe.srcdoc = '';
+            data.iframe.remove();
+        }
+        // Remove orphaned placeholder from DOM (it's detached after innerHTML replace)
+        if (placeholder.isConnected) placeholder.remove();
+        toRemove.push(placeholder);
+    }
+    for (const p of toRemove) iframePlaceholders.delete(p);
+    if (toRemove.length > 0) {
+        console.debug(`${LOG_PREFIX} Cleaned up ${toRemove.length} stale placeholder(s) for mesId ${mesId}`);
     }
 }
 
@@ -900,23 +935,31 @@ function updateStatsUI() {
         // ---- New modules ----
 
         // Optimization 6: Lightweight HTML renderer
-        if (settings.enabled && settings.lightHtmlRenderer) {
-            // Process messages as they render
-            eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, (mesId) => {
-                processMessageForIframes(mesId);
-            });
-            eventSource.on(event_types.USER_MESSAGE_RENDERED, (mesId) => {
-                processMessageForIframes(mesId);
-            });
-
-            // Process all messages when a chat is loaded
-            eventSource.on(event_types.CHAT_CHANGED, () => {
-                // Clean up previous chat's iframes
-                cleanupAllIframes();
-                // Small delay to let the DOM populate
-                setTimeout(() => processAllMessagesForIframes(), 200);
-            });
-        }
+        // Always register listeners; processMessageForIframes checks settings internally.
+        eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, (mesId) => {
+            processMessageForIframes(mesId);
+        });
+        eventSource.on(event_types.USER_MESSAGE_RENDERED, (mesId) => {
+            processMessageForIframes(mesId);
+        });
+        // After edit: MESSAGE_UPDATED fires (not CHARACTER_MESSAGE_RENDERED)
+        eventSource.on(event_types.MESSAGE_UPDATED, (mesId) => {
+            processMessageForIframes(mesId);
+        });
+        // After swipe: re-render the swiped message
+        eventSource.on(event_types.MESSAGE_SWIPED, (mesId) => {
+            processMessageForIframes(mesId);
+        });
+        // When more historical messages load at the top of the chat
+        eventSource.on(event_types.MORE_MESSAGES_LOADED, () => {
+            processAllMessagesForIframes();
+        });
+        // Process all messages when a chat is loaded
+        eventSource.on(event_types.CHAT_CHANGED, () => {
+            cleanupAllIframes();
+            // Small delay to let the DOM populate
+            setTimeout(() => processAllMessagesForIframes(), 300);
+        });
 
         // Optimization 7: Tab-switch scroll preservation
         if (settings.enabled && settings.preventScrollJump) {
